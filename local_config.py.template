@@ -9,6 +9,8 @@ ERPNEXT_VERSION = 15
 # operational configs
 PULL_FREQUENCY = 60 # in minutes
 LOGS_DIRECTORY = 'logs' # logs of this script is stored in this directory
+LOG_MAX_MB = 2 # archive a log when it reaches this size
+LOG_RETENTION_DAYS = 30 # delete archived logs older than this
 IMPORT_START_DATE = None # format: '20190501'
 
 # Biometric device configs (all keys mandatory, except latitude and longitude they are mandatory only if 'Allow Geolocation Tracking' is turned on in Frappe HR)
@@ -19,10 +21,7 @@ IMPORT_START_DATE = None # format: '20190501'
                                     #(Caution: this feature can lead to data loss if used carelessly.)
     #- latitude - float, latitude of the location of the device
     #- longitude - float, longitude of the location of the device
-devices = [
-    {'device_id':'test_1','ip':'192.168.0.209', 'punch_direction': None, 'clear_from_device_on_fetch': False, 'latitude':0.0000,'longitude':0.0000},
-    {'device_id':'test_2','ip':'192.168.2.209', 'punch_direction': None, 'clear_from_device_on_fetch': False, 'latitude':0.0000,'longitude':0.0000}
-]
+devices = []
 
 # Hikvision ISAPI device example. The computer running this app must be on the
 # same LAN/Wi-Fi as the device; do not expose the device to the public internet.
@@ -34,9 +33,7 @@ devices = [
 
 # Configs updating sync timestamp in the Shift Type DocType 
 # please, read this thread to know why this is necessary https://discuss.erpnext.com/t/v-12-hr-auto-attendance-purpose-of-last-sync-of-checkin-in-shift-type/52997
-shift_type_device_mapping = [
-    {'shift_type_name': ['Shift1'], 'related_device_id': ['test_1','test_2']}
-]
+shift_type_device_mapping = []
 
 
 # Ignore following exceptions thrown by ERPNext and continue importing punch logs.

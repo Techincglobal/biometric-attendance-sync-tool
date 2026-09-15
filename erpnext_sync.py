@@ -1,7 +1,7 @@
 
-import local_config as config
 import requests
 import datetime
+import glob
 import json
 import os
 import sys
@@ -11,6 +11,9 @@ from logging.handlers import RotatingFileHandler
 from pickledb import PickleDB
 from zk import ZK, const
 from hikvision import HikvisionAttendanceClient
+from config_manager import load_config
+
+config = load_config()
 
 EMPLOYEE_NOT_FOUND_ERROR_MESSAGE = "No Employee found for the given employee field value"
 EMPLOYEE_INACTIVE_ERROR_MESSAGE = "Transactions cannot be created for an Inactive Employee"
@@ -332,12 +335,23 @@ def get_last_line_from_file(file):
     return line
 
 
+class ArchivedRotatingFileHandler(RotatingFileHandler):
+    """Move size-rotated logs into the archive folder instead of keeping them live."""
+
+    def rotation_filename(self, default_name):
+        return os.path.join(config.LOGS_DIRECTORY, 'archive', os.path.basename(default_name))
+
+
 def setup_logger(name, log_file, level=logging.INFO, formatter=None):
 
     if not formatter:
         formatter = logging.Formatter('%(asctime)s\t%(levelname)s\t%(message)s')
 
-    handler = RotatingFileHandler(log_file, maxBytes=10000000, backupCount=50)
+    handler = ArchivedRotatingFileHandler(
+        log_file,
+        maxBytes=getattr(config, 'LOG_MAX_MB', 2) * 1024 * 1024,
+        backupCount=getattr(config, 'LOG_ARCHIVE_COUNT', 15),
+    )
     handler.setFormatter(formatter)
 
     logger = logging.getLogger(name)
@@ -372,6 +386,15 @@ def _safe_get_error_str(res):
     return error_str
 
 
+def cleanup_old_archives():
+    retention_days = getattr(config, 'LOG_RETENTION_DAYS', 30)
+    cutoff = time.time() - (retention_days * 24 * 60 * 60)
+    archive_pattern = os.path.join(config.LOGS_DIRECTORY, 'archive', '*.log.*')
+    for log_file in glob.glob(archive_pattern):
+        if os.path.getmtime(log_file) < cutoff:
+            os.remove(log_file)
+
+
 def _loggable_device(device):
     safe_device = dict(device)
     if 'password' in safe_device:
@@ -381,6 +404,8 @@ def _loggable_device(device):
 # setup logger and status
 if not os.path.exists(config.LOGS_DIRECTORY):
     os.makedirs(config.LOGS_DIRECTORY)
+os.makedirs(os.path.join(config.LOGS_DIRECTORY, 'archive'), exist_ok=True)
+cleanup_old_archives()
 error_logger = setup_logger('error_logger', '/'.join([config.LOGS_DIRECTORY, 'error.log']), logging.ERROR)
 info_logger = setup_logger('info_logger', '/'.join([config.LOGS_DIRECTORY, 'logs.log']))
 status = PickleDB('/'.join([config.LOGS_DIRECTORY, 'status.json']), auto_dump=True, sig=False)

@@ -1,550 +1,340 @@
-import datetime
+"""Modern desktop dashboard for the attendance sync service."""
+
 import json
 import os
-import shlex
-import sys
+import socket
 import subprocess
+import sys
+
 import requests
-import local_config as config
-
 from PyQt5 import QtCore
-from PyQt5 import QtWidgets
-from PyQt5.QtCore import QRegExp
-from PyQt5.QtGui import QIntValidator, QRegExpValidator
-from PyQt5.QtWidgets import QApplication, QComboBox, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton
+from PyQt5.QtGui import QColor, QIcon, QPixmap
+from PyQt5.QtWidgets import (QAction, QApplication, QCheckBox, QComboBox, QDialog,
+    QDialogButtonBox, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QLabel,
+    QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
+    QMenu, QSpinBox, QSplashScreen, QStackedWidget, QSystemTrayIcon, QTableWidget,
+    QTableWidgetItem, QVBoxLayout, QWidget)
+
 from hikvision import HikvisionAttendanceClient, HikvisionConnectionError
+from config_manager import config_path, load_config
+
+config = load_config()
 
 
-config_template = '''# ERPNext related configs
-ERPNEXT_API_KEY = '{0}'
-ERPNEXT_API_SECRET = '{1}'
-ERPNEXT_URL = '{2}'
-ERPNEXT_VERSION = {3}
+STYLE = """
+QMainWindow,QDialog,QMessageBox { background:#07101f; color:#eaf0ff; } QWidget { font-family:Segoe UI; font-size:13px; color:#eaf0ff; }
+QFrame#sidebar { background:#050b16; border-right:1px solid #16243b; } QFrame#card { background:#0c1728; border:1px solid #1a2a45; border-radius:10px; }
+QLabel#eyebrow { color:#77a5ff; font-size:11px; font-weight:700; } QLabel#title { font-size:26px; font-weight:600; } QLabel#muted { color:#95a7c3; }
+QLineEdit,QSpinBox,QComboBox,QPlainTextEdit,QTableWidget { background:#07101f; border:1px solid #28405f; border-radius:6px; padding:7px; }
+QPushButton { background:#1268ff; border:0; border-radius:6px; padding:8px 13px; font-weight:600; } QPushButton:hover { background:#2b7cff; } QPushButton:disabled { background:#33445e; }
+QPushButton#nav { background:transparent; color:#9aabc6; text-align:left; padding:10px 14px; } QPushButton#nav:checked { background:#102b55; color:white; border-left:3px solid #4f8cff; }
+QHeaderView::section { background:#102039; color:#aebfdb; border:0; padding:8px; font-weight:600; } QTableWidget { gridline-color:#1b2d48; selection-background-color:#173762; }
+QMessageBox QLabel,QDialog QLabel { color:#eaf0ff; } QMenu { background:#0c1728; border:1px solid #28405f; } QMenu::item { padding:8px 24px; } QMenu::item:selected { background:#173762; }
+"""
 
 
-# operational configs
-PULL_FREQUENCY = {4} or 60 # in minutes
-LOGS_DIRECTORY = 'logs' # logs of this script is stored in this directory
-IMPORT_START_DATE = '{5}' or None # format: '20190501'
-
-# Biometric device configs (all keys mandatory)
-    #- device_id - must be unique, strictly alphanumerical chars only. no space allowed.
-    #- ip - device IP Address
-    #- punch_direction - 'IN'/'OUT'/'AUTO'/None
-    #- clear_from_device_on_fetch: if set to true then attendance is deleted after fetch is successful.
-    #(Caution: this feature can lead to data loss if used carelessly.)
-devices = {6}
-
-# Configs updating sync timestamp in the Shift Type DocType
-shift_type_device_mapping = {7}
-'''
+def message(parent, title, text, warning=False):
+    box = QMessageBox(parent); box.setWindowTitle(title); box.setText(text)
+    box.setIcon(QMessageBox.Warning if warning else QMessageBox.Information); box.exec_()
 
 
-class BiometricWindow(QMainWindow):
-    def __init__(self):
+def line(value="", secret=False):
+    control = QLineEdit(str(value or "")); control.setEchoMode(QLineEdit.Password if secret else QLineEdit.Normal)
+    return control
+
+
+def resource_path(*parts):
+    root = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(root, *parts)
+
+
+def set_windows_application_id():
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("techinc.attendance-sync")
+    except (AttributeError, OSError):
+        pass
+
+
+class DeviceDialog(QDialog):
+    def __init__(self, device=None, parent=None):
+        super().__init__(parent); self.setWindowTitle("Add device" if device is None else "Edit device"); self.setMinimumWidth(430)
+        device = device or {}; layout = QVBoxLayout(self); form = QFormLayout()
+        self.device_id, self.host = line(device.get("device_id")), line(device.get("ip"))
+        self.kind = QComboBox(); self.kind.addItems(["hikvision", "zkteco"]); self.kind.setCurrentText(device.get("device_type", "zkteco"))
+        self.port = QSpinBox(); self.port.setRange(1, 65535); self.port.setValue(int(device.get("port", 80 if self.kind.currentText() == "hikvision" else 4370)))
+        self.user, self.password = line(device.get("username")), line(device.get("password"), True)
+        self.major, self.minor = QSpinBox(), QSpinBox(); self.major.setRange(0, 999); self.minor.setRange(0, 999); self.major.setValue(int(device.get("major", 5))); self.minor.setValue(int(device.get("minor", 0)))
+        self.shift = line(device.get("shift", "")); self.direction = QComboBox(); self.direction.addItems(["None", "AUTO", "IN", "OUT"]); self.direction.setCurrentText(device.get("punch_direction") or "None")
+        self.clear = QCheckBox("Clear device records after successful push"); self.clear.setChecked(bool(device.get("clear_from_device_on_fetch", False)))
+        for label, control in (("Device ID", self.device_id), ("LAN IP / hostname", self.host), ("Device type", self.kind), ("Port", self.port), ("Username (Hikvision)", self.user), ("Password (Hikvision)", self.password), ("Hikvision major", self.major), ("Hikvision minor", self.minor), ("ERPNext shift", self.shift), ("Punch direction", self.direction)): form.addRow(label, control)
+        layout.addLayout(form); layout.addWidget(self.clear); buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel); buttons.accepted.connect(self.accept); buttons.rejected.connect(self.reject); layout.addWidget(buttons)
+
+    def value(self):
+        return {"device_id": self.device_id.text().strip(), "ip": self.host.text().strip(), "device_type": self.kind.currentText(), "port": self.port.value(), "username": self.user.text(), "password": self.password.text(), "major": self.major.value(), "minor": self.minor.value(), "shift": self.shift.text().strip(), "punch_direction": None if self.direction.currentText() == "None" else self.direction.currentText(), "clear_from_device_on_fetch": self.clear.isChecked(), "latitude": None, "longitude": None}
+
+
+class DeviceProbeWorker(QtCore.QThread):
+    results_ready = QtCore.pyqtSignal(dict)
+
+    def __init__(self, devices):
         super().__init__()
-        self.reg_exp_for_ip = r"((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(?=\s*netmask)"
-        self.init_ui()
+        self.devices = [dict(device) for device in devices]
+
+    def run(self):
+        results = {}
+        for device in self.devices:
+            try:
+                if device.get("device_type") == "hikvision":
+                    HikvisionAttendanceClient(device["ip"], device.get("username", ""), device.get("password", ""), port=device.get("port", 80), timeout=4).test_connection()
+                else:
+                    with socket.create_connection((device["ip"], int(device.get("port", 4370))), timeout=4): pass
+                results[device["device_id"]] = (True, "Online")
+            except (HikvisionConnectionError, OSError, ValueError):
+                results[device["device_id"]] = (False, "Offline")
+        self.results_ready.emit(results)
+
+
+class AttendanceWindow(QMainWindow):
+    def __init__(self):
+        super().__init__(); self.devices = [dict(item) for item in config.devices]
+        for device in self.devices: device.setdefault("shift", self.shift(device.get("device_id")))
+        self.service = None; self.manual = None; self.allow_exit = False; self.tray = None; self.device_health = {}; self.health_worker = None
+        self.setWindowTitle("Attendance Sync"); self.resize(1180, 760); self.setMinimumSize(980, 650); self.build(); self.refresh_all()
+        self.setWindowIcon(QIcon(resource_path("assets", "attendance_sync.ico")))
+        self.create_tray()
+        self.show_page(2 if self.first_launch() else 0)
+        self.health_timer = QtCore.QTimer(self); self.health_timer.timeout.connect(self.probe_devices); self.health_timer.start(60000); self.probe_devices()
+
+    def build(self):
+        root = QWidget(); self.setCentralWidget(root); main = QHBoxLayout(root); main.setContentsMargins(0, 0, 0, 0); main.setSpacing(0)
+        main.addWidget(self.sidebar()); self.stack = QStackedWidget(); main.addWidget(self.stack, 1)
+        self.stack.addWidget(self.dashboard()); self.stack.addWidget(self.devices_page()); self.stack.addWidget(self.connection_page()); self.stack.addWidget(self.logs_page()); self.stack.addWidget(self.settings_page())
+
+    def sidebar(self):
+        panel = QFrame(); panel.setObjectName("sidebar"); panel.setFixedWidth(205); layout = QVBoxLayout(panel); layout.setContentsMargins(14, 22, 14, 16); layout.setSpacing(4)
+        brand = QLabel("ATTENDANCE\nSYNC"); brand.setStyleSheet("font-size:18px;font-weight:700;color:white;letter-spacing:1px;"); layout.addWidget(brand)
+        subtitle = QLabel("ERPNext local bridge"); subtitle.setObjectName("muted"); layout.addWidget(subtitle); layout.addSpacing(30); self.nav = []
+        for label, page in (("Dashboard", 0), ("Devices", 1), ("Connection", 2), ("Live logs", 3), ("Settings", 4)):
+            button = QPushButton(label); button.setObjectName("nav"); button.setCheckable(True); button.clicked.connect(lambda _, index=page: self.show_page(index)); layout.addWidget(button); self.nav.append(button)
+        layout.addStretch(); self.service_label = QLabel("● Service stopped"); self.service_label.setObjectName("muted"); layout.addWidget(self.service_label); return panel
+
+    def shell(self, eyebrow, title, detail):
+        page = QWidget(); layout = QVBoxLayout(page); layout.setContentsMargins(30, 26, 30, 18); layout.setSpacing(14)
+        a, b, c = QLabel(eyebrow.upper()), QLabel(title), QLabel(detail); a.setObjectName("eyebrow"); b.setObjectName("title"); c.setObjectName("muted"); c.setWordWrap(True)
+        layout.addWidget(a); layout.addWidget(b); layout.addWidget(c); return page, layout
+
+    def dashboard(self):
+        page, layout = self.shell("Operations · Local bridge", "Every punch, accounted for.", "Pull LAN terminals locally, then post Employee Checkins securely to ERPNext.")
+        grid = QGridLayout(); self.stats = []
+        for index, (label, value, note) in enumerate((("Devices", "0", "configured"), ("Last successful sync", "—", "not recorded"), ("Errors", "0", "in error log"), ("Service", "Stopped", "manual available"))):
+            card = QFrame(); card.setObjectName("card"); box = QVBoxLayout(card); small = QLabel(label.upper()); small.setObjectName("eyebrow"); number = QLabel(value); number.setStyleSheet("font-size:23px;font-weight:600;"); muted = QLabel(note); muted.setObjectName("muted"); box.addWidget(small); box.addWidget(number); box.addWidget(muted); grid.addWidget(card, 0, index); self.stats.append(number)
+        layout.addLayout(grid); actions = QHBoxLayout(); self.sync_button = QPushButton("Sync now"); self.sync_button.clicked.connect(self.manual_sync); self.service_button = QPushButton("Start service"); self.service_button.clicked.connect(self.toggle_service); open_logs = QPushButton("Open live logs"); open_logs.clicked.connect(lambda: self.show_page(3)); actions.addWidget(self.sync_button); actions.addWidget(self.service_button); actions.addWidget(open_logs); actions.addStretch(); layout.addLayout(actions)
+        self.dashboard_table = self.table(["Device", "Type", "LAN address", "Last sync", "Status"]); layout.addWidget(self.dashboard_table, 1); return page
+
+    def devices_page(self):
+        page, layout = self.shell("Terminals", "Devices on your LAN.", "Configure Hikvision or ZKTeco terminals. Credentials remain on this computer.")
+        actions = QHBoxLayout()
+        for label, callback in (("Add device", self.add_device), ("Edit selected", self.edit_device), ("Remove selected", self.remove_device), ("Test selected", self.test_device), ("Save configuration", self.save)):
+            button = QPushButton(label); button.clicked.connect(callback); actions.addWidget(button)
+        actions.addStretch(); layout.addLayout(actions); self.devices_table = self.table(["Device ID", "Type", "LAN address", "Port", "Shift", "Status"]); self.devices_table.setSelectionBehavior(QTableWidget.SelectRows); layout.addWidget(self.devices_table, 1); return page
+
+    def connection_page(self):
+        page, layout = self.shell("ERPNext", "Connect your attendance ledger.", "Test credentials before syncing. This check does not create attendance records.")
+        card = QFrame(); card.setObjectName("card"); form = QFormLayout(card); form.setContentsMargins(24, 24, 24, 24); self.erp_url, self.erp_key, self.erp_secret = line(config.ERPNEXT_URL), line(config.ERPNEXT_API_KEY), line(config.ERPNEXT_API_SECRET, True)
+        form.addRow("ERPNext URL", self.erp_url); form.addRow("API key", self.erp_key); form.addRow("API secret", self.erp_secret); layout.addWidget(card)
+        actions = QHBoxLayout(); test, save = QPushButton("Test ERPNext"), QPushButton("Save connection"); test.clicked.connect(self.test_erp); save.clicked.connect(self.save); actions.addWidget(test); actions.addWidget(save); actions.addStretch(); layout.addLayout(actions); layout.addStretch(); return page
+
+    def logs_page(self):
+        page, layout = self.shell("Diagnostics", "Live logs.", "Read service output locally for device, ERPNext, and manual-sync debugging."); actions = QHBoxLayout(); self.log_choice = QComboBox(); self.log_choice.addItems(["Service log", "Error log", "Manual sync console"]); self.log_choice.currentIndexChanged.connect(self.refresh_logs); refresh = QPushButton("Refresh"); refresh.clicked.connect(self.refresh_logs); actions.addWidget(self.log_choice); actions.addWidget(refresh); actions.addStretch(); layout.addLayout(actions); self.log_view = QPlainTextEdit(); self.log_view.setReadOnly(True); self.log_view.setLineWrapMode(QPlainTextEdit.NoWrap); layout.addWidget(self.log_view, 1); return page
+
+    def settings_page(self):
+        page, layout = self.shell("Preferences", "Control the local service.", "Manual sync is always available. Start the service only when timed polling is required.")
+        card = QFrame(); card.setObjectName("card"); form = QFormLayout(card); form.setContentsMargins(24, 24, 24, 24); self.frequency = QSpinBox(); self.frequency.setRange(1, 1440); self.frequency.setValue(int(config.PULL_FREQUENCY)); self.start_date = line(config.IMPORT_START_DATE or ""); self.log_size = QSpinBox(); self.log_size.setRange(1, 100); self.log_size.setValue(int(getattr(config, "LOG_MAX_MB", 2))); self.log_days = QSpinBox(); self.log_days.setRange(1, 365); self.log_days.setValue(int(getattr(config, "LOG_RETENTION_DAYS", 30))); form.addRow("Pull frequency (minutes)", self.frequency); form.addRow("Import start date (YYYYMMDD)", self.start_date); form.addRow("Archive logs after (MB)", self.log_size); form.addRow("Delete archived logs after (days)", self.log_days); layout.addWidget(card); save = QPushButton("Save settings"); save.clicked.connect(self.save); layout.addWidget(save); layout.addStretch(); return page
+
+    def table(self, headers):
+        table = QTableWidget(0, len(headers)); table.setHorizontalHeaderLabels(headers); table.setEditTriggers(QTableWidget.NoEditTriggers); table.horizontalHeader().setStretchLastSection(True); return table
+
+    def show_page(self, index):
+        self.stack.setCurrentIndex(index)
+        for position, button in enumerate(self.nav): button.setChecked(position == index)
+        if index == 3: self.refresh_logs()
+        if index in (0, 1): self.refresh_all()
+
+    def refresh_all(self): self.refresh_devices(); self.refresh_dashboard(); self.refresh_logs()
+
+    def refresh_devices(self):
+        self.devices_table.setRowCount(len(self.devices))
+        for row, device in enumerate(self.devices):
+            values = [device.get("device_id"), device.get("device_type", "zkteco"), device.get("ip"), device.get("port"), device.get("shift") or self.shift(device.get("device_id")), self.health_label(device.get("device_id"))]
+            self.set_table_row(self.devices_table, row, values)
+
+    def refresh_dashboard(self):
+        state = self.status(); running = self.service and self.service.poll() is None; self.stats[0].setText(str(len(self.devices))); last = state.get("mission_accomplished_timestamp", "—"); self.stats[1].setText(str(last)[:19]); self.stats[2].setText(str(self.error_count())); self.stats[3].setText("Running" if running else "Stopped")
+        self.service_label.setText("● Service running" if running else "● Service stopped"); self.service_label.setStyleSheet("color: #40d98b;" if running else "color: #ff667a;")
+        self.dashboard_table.setRowCount(len(self.devices))
+        for row, device in enumerate(self.devices):
+            values = [device.get("device_id"), device.get("device_type", "zkteco"), device.get("ip"), str(state.get(f'{device.get("device_id")}_push_timestamp', "—"))[:19], self.health_label(device.get("device_id"))]
+            self.set_table_row(self.dashboard_table, row, values)
+
+    def set_table_row(self, table, row, values):
+        for column, value in enumerate(values):
+            item = QTableWidgetItem(str(value or "—"))
+            if column == len(values) - 1 and str(value).endswith("Online"):
+                item.setForeground(QColor("#40d98b"))
+            elif column == len(values) - 1 and str(value).endswith("Offline"):
+                item.setForeground(QColor("#ff667a"))
+            table.setItem(row, column, item)
+
+    def health_label(self, device_id):
+        connected, label = self.device_health.get(device_id, (None, "Checking…"))
+        return ("● " + label) if connected is not None else label
+
+    def probe_devices(self):
+        if self.health_worker and self.health_worker.isRunning(): return
+        self.device_health = {device.get("device_id"): (None, "Checking…") for device in self.devices}
+        self.refresh_devices(); self.refresh_dashboard()
+        self.health_worker = DeviceProbeWorker(self.devices); self.health_worker.results_ready.connect(self.apply_device_health); self.health_worker.start()
+
+    def apply_device_health(self, results):
+        self.device_health = results; self.refresh_devices(); self.refresh_dashboard()
+
+    def status(self):
+        try:
+            with open(os.path.join(config.LOGS_DIRECTORY, "status.json"), encoding="utf-8") as handle: return json.load(handle)
+        except (OSError, ValueError): return {}
+
+    def error_count(self):
+        try:
+            with open(os.path.join(config.LOGS_DIRECTORY, "error.log"), encoding="utf-8") as handle: return sum("\tERROR\t" in row for row in handle)
+        except OSError: return 0
+
+    def selected(self):
+        rows = self.devices_table.selectionModel().selectedRows(); return rows[0].row() if rows else None
+
+    def add_device(self):
+        dialog = DeviceDialog(parent=self)
+        if dialog.exec_() == QDialog.Accepted:
+            value = dialog.value()
+            if not value["device_id"] or not value["ip"]: return message(self, "Missing values", "Device ID and LAN IP / hostname are required.", True)
+            self.devices.append(value); self.refresh_all()
+
+    def edit_device(self):
+        index = self.selected()
+        if index is None: return message(self, "Select a device", "Select a device to edit first.", True)
+        dialog = DeviceDialog(self.devices[index], self)
+        if dialog.exec_() == QDialog.Accepted: self.devices[index] = dialog.value(); self.refresh_all()
+
+    def remove_device(self):
+        index = self.selected()
+        if index is None: return message(self, "Select a device", "Select a device to remove first.", True)
+        if QMessageBox.question(self, "Remove device", "Remove the selected device from this unsaved configuration?") == QMessageBox.Yes: self.devices.pop(index); self.refresh_all()
+
+    def test_device(self):
+        index = self.selected()
+        if index is None: return message(self, "Select a device", "Select a device to test first.", True)
+        device = self.devices[index]
+        if device.get("device_type") != "hikvision": return message(self, "ZKTeco test", "Use Sync now to test a ZKTeco device connection.", True)
+        try: HikvisionAttendanceClient(device["ip"], device.get("username", ""), device.get("password", ""), port=device.get("port", 80)).test_connection()
+        except HikvisionConnectionError as error: return message(self, "Device connection failed", str(error), True)
+        message(self, "Device connection", "Hikvision device responded successfully.")
+
+    def test_erp(self):
+        try:
+            response = requests.get(self.erp_url.text().rstrip("/") + "/api/method/frappe.auth.get_logged_user", headers={"Authorization": "token " + self.erp_key.text() + ":" + self.erp_secret.text()}, timeout=15); response.raise_for_status(); user = response.json().get("message", "authenticated user")
+        except (requests.RequestException, ValueError) as error: return message(self, "ERPNext connection failed", str(error), True)
+        message(self, "ERPNext connection", "Connected successfully as: " + str(user))
+
+    def manual_sync(self):
+        if self.service: return message(self, "Manual sync", "Stop the timed service before starting a manual sync.", True)
+        if self.manual: return
+        os.makedirs(config.LOGS_DIRECTORY, exist_ok=True); self.output = open(os.path.join(config.LOGS_DIRECTORY, "manual_sync_console.log"), "a", encoding="utf-8")
+        self.manual = subprocess.Popen([sys.executable, "-c", "from erpnext_sync import main; main(force=True)"], stdout=self.output, stderr=subprocess.STDOUT); self.sync_button.setEnabled(False); QtCore.QTimer.singleShot(500, self.check_manual)
+
+    def check_manual(self):
+        if self.manual.poll() is None: return QtCore.QTimer.singleShot(500, self.check_manual)
+        result = self.manual.returncode; self.output.close(); self.manual = None; self.sync_button.setEnabled(True); self.refresh_all(); message(self, "Manual sync", "Manual sync finished. Review Live logs for results." if result == 0 else "Manual sync failed. Review Live logs.", result != 0)
+
+    def toggle_service(self):
+        if self.service: self.service.kill(); self.service = None; self.service_button.setText("Start service"); self.service_label.setText("● Service stopped")
+        else: self.service = subprocess.Popen([sys.executable, "-c", "from erpnext_sync import infinite_loop; infinite_loop()"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); self.service_button.setText("Stop service"); self.service_label.setText("● Service running")
+        self.refresh_dashboard()
+
+    def first_launch(self):
+        return not all((config.ERPNEXT_URL, config.ERPNEXT_API_KEY, config.ERPNEXT_API_SECRET))
+
+    def create_tray(self):
+        if not QSystemTrayIcon.isSystemTrayAvailable(): return
+        self.tray = QSystemTrayIcon(QIcon(resource_path("assets", "attendance_sync.ico")), self)
+        menu = QMenu(self); open_action = QAction("Open Attendance Sync", self); open_action.triggered.connect(self.restore_window)
+        exit_action = QAction("Exit", self); exit_action.triggered.connect(self.exit_application)
+        menu.addAction(open_action); menu.addSeparator(); menu.addAction(exit_action); self.tray.setContextMenu(menu)
+        self.tray.activated.connect(lambda reason: self.restore_window() if reason == QSystemTrayIcon.Trigger else None); self.tray.show()
+
+    def restore_window(self):
+        self.showNormal(); self.activateWindow(); self.raise_()
+
+    def exit_application(self):
+        self.allow_exit = True
+        if self.service: self.service.kill()
+        if self.manual: self.manual.kill()
+        QApplication.quit()
+
+    def refresh_logs(self):
+        files = ["logs.log", "error.log", "manual_sync_console.log"]; index = self.log_choice.currentIndex() if hasattr(self, "log_choice") else 0
+        try:
+            with open(os.path.join(config.LOGS_DIRECTORY, files[index]), encoding="utf-8") as handle: text = handle.read()[-30000:]
+        except OSError: text = "No log file exists yet."
+        if hasattr(self, "log_view"): self.log_view.setPlainText(text)
+
+    def shift(self, device_id):
+        for mapping in getattr(config, "shift_type_device_mapping", []):
+            if device_id in mapping.get("related_device_id", []):
+                name = mapping.get("shift_type_name", ""); return name[0] if isinstance(name, list) and name else name
+        return ""
+
+    def save(self):
+        global config
+        if not all((self.erp_url.text().strip(), self.erp_key.text().strip(), self.erp_secret.text().strip())): return message(self, "Missing connection values", "ERPNext URL, API key, and API secret are required.", True)
+        ids = [device.get("device_id") for device in self.devices]
+        if not ids or any(not item for item in ids) or len(ids) != len(set(ids)): return message(self, "Invalid devices", "Add devices with unique Device IDs before saving.", True)
+        groups = {}
+        for device in self.devices:
+            if device.get("shift"): groups.setdefault(device["shift"], []).append(device["device_id"])
+        mappings = [{"shift_type_name": name, "related_device_id": ids} for name, ids in groups.items()]
+        saved_devices = [{key: value for key, value in device.items() if key != "shift"} for device in self.devices]
+        content = "\n".join(["ERPNEXT_API_KEY = " + repr(self.erp_key.text().strip()), "ERPNEXT_API_SECRET = " + repr(self.erp_secret.text().strip()), "ERPNEXT_URL = " + repr(self.erp_url.text().strip().rstrip("/")), "ERPNEXT_VERSION = " + repr(getattr(config, "ERPNEXT_VERSION", 15)), "PULL_FREQUENCY = " + repr(self.frequency.value()), "LOGS_DIRECTORY = " + repr(getattr(config, "LOGS_DIRECTORY", "logs")), "LOG_MAX_MB = " + repr(self.log_size.value()), "LOG_RETENTION_DAYS = " + repr(self.log_days.value()), "IMPORT_START_DATE = " + repr(self.start_date.text().strip() or None), "devices = " + repr(saved_devices), "shift_type_device_mapping = " + repr(mappings), "allowed_exceptions = [1, 2, 3]", ""])
+        with open(config_path(), "w", encoding="utf-8") as handle: handle.write(content)
+        config = load_config()
+        message(self, "Configuration saved", "Saved locally. Test ERPNext or use Sync now to verify it.")
 
     def closeEvent(self, event):
-        can_exit = not hasattr(self, "p")
-        if can_exit:
-            event.accept()
-        else:
-            create_message_box(text="Window cannot be closed when \nservice is running!", title="Message", width=200)
-            event.ignore()
-
-    def init_ui(self):
-        self.counter = 0
-        self.setup_window()
-        self.setup_textboxes_and_label()
-        self.center()
-        self.show()
-
-    def setup_window(self):
-        self.setFixedSize(890, 580)
-        self.setWindowTitle('ERPNext Attendance Sync')
-        self.setStyleSheet("QMainWindow { background: #f7f9fc; } QLineEdit, QComboBox { padding: 5px; background: white; border: 1px solid #cbd5e1; border-radius: 4px; } QPushButton { padding: 6px 10px; background: #2563eb; color: white; border: 0; border-radius: 4px; } QPushButton:disabled { background: #94a3b8; }")
-
-    def setup_textboxes_and_label(self):
-
-        self.create_label("API Secret", "api_secret", 20, 0, 200, 30)
-        self.create_field("textbox_erpnext_api_secret", 20, 30, 200, 30)
-
-        self.create_label("API Key", "api_key", 20, 60, 200, 30)
-        self.create_field("textbox_erpnext_api_key", 20, 90, 200, 30)
-
-        self.create_label("ERPNext URL", "erpnext_url", 20, 120, 200, 30)
-        self.create_field("textbox_erpnext_url", 20, 150, 200, 30)
-
-        self.create_label("Pull Frequency (in minutes)",
-                          "pull_frequency", 250, 0, 200, 30)
-        self.create_field("textbox_pull_frequency", 250, 30, 200, 30)
-
-        self.create_label("Import Start Date",
-                          "import_start_date", 250, 60, 200, 30)
-        self.create_field("textbox_import_start_date", 250, 90, 200, 30)
-        self.validate_data(r"^\d{1,2}/\d{1,2}/\d{4}$", "textbox_import_start_date")
-
-        self.create_separator(210, 890)
-        self.create_button('+ Device', 'add', 730, 225, 70, 30, self.add_devices_fields)
-        self.create_button('- Device', 'remove', 805, 225, 70, 30, self.remove_devices_fields)
-
-        self.create_label("Device ID", "device_id", 20, 260, 0, 30)
-        self.create_label("LAN IP / hostname", "device_ip", 140, 260, 0, 30)
-        self.create_label("Type", "device_type", 280, 260, 0, 30)
-        self.create_label("Hikvision user", "device_user", 375, 260, 0, 30)
-        self.create_label("Hikvision password", "device_password", 485, 260, 0, 30)
-        self.create_label("Port", "device_port", 600, 260, 0, 30)
-        self.create_label("Shift", "shift", 665, 260, 0, 0)
-
-        # First Row for table
-        self.create_device_fields(0)
-
-        # Actions buttons
-        self.create_button('Save Configuration', 'set_conf', 20, 530, 150, 30, self.setup_local_config)
-        self.create_button('Test Hikvision', 'test_hikvision', 180, 530, 130, 30, self.test_hikvision_connections)
-        self.create_button('Test ERPNext', 'test_erpnext', 320, 530, 120, 30, self.test_erpnext_connection)
-        self.create_button('Sync Now', 'sync_now', 450, 530, 110, 30, self.run_manual_sync)
-        self.create_button('Running Status', 'running_status', 570, 530, 120, 30, self.get_running_status, enable=False)
-        self.create_button('Start Service', 'start_or_stop_service', 700, 530, 120, 30, self.integrate_biometric, enable=False)
-        self.set_default_value_or_placeholder_of_field()
-
-        # validating integer
-        self.onlyInt = QIntValidator(10, 30)
-        self.textbox_pull_frequency.setValidator(self.onlyInt)
-
-    def set_default_value_or_placeholder_of_field(self):
-        if os.path.exists("local_config.py"):
-            import local_config as config
-            self.textbox_erpnext_api_secret.setText(config.ERPNEXT_API_SECRET)
-            self.textbox_erpnext_api_key.setText(config.ERPNEXT_API_KEY)
-            self.textbox_erpnext_url.setText(config.ERPNEXT_URL)
-            self.textbox_pull_frequency.setText(str(config.PULL_FREQUENCY))
-
-            if len(config.devices):
-                self.device_id_0.setText(config.devices[0]['device_id'])
-                self.device_ip_0.setText(config.devices[0]['ip'])
-                self.device_type_0.setCurrentText(config.devices[0].get('device_type', 'zkteco'))
-                self.device_user_0.setText(config.devices[0].get('username', ''))
-                self.device_password_0.setText(config.devices[0].get('password', ''))
-                self.device_port_0.setText(str(config.devices[0].get('port', 4370)))
-                self.shift_0.setText(
-                    self.get_shift_name_for_device(config, config.devices[0]['device_id']))
-
-            if len(config.devices) > 1:
-                for _ in range(self.counter, len(config.devices) - 1):
-                    self.add_devices_fields()
-
-                    device = getattr(self, 'device_id_' + str(self.counter))
-                    ip = getattr(self, 'device_ip_' + str(self.counter))
-                    device_type = getattr(self, 'device_type_' + str(self.counter))
-                    username = getattr(self, 'device_user_' + str(self.counter))
-                    password = getattr(self, 'device_password_' + str(self.counter))
-                    port = getattr(self, 'device_port_' + str(self.counter))
-                    shift = getattr(self, 'shift_' + str(self.counter))
-
-                    device.setText(config.devices[self.counter]['device_id'])
-                    ip.setText(config.devices[self.counter]['ip'])
-                    device_type.setCurrentText(config.devices[self.counter].get('device_type', 'zkteco'))
-                    username.setText(config.devices[self.counter].get('username', ''))
-                    password.setText(config.devices[self.counter].get('password', ''))
-                    port.setText(str(config.devices[self.counter].get('port', 4370)))
-                    shift.setText(
-                        self.get_shift_name_for_device(config, config.devices[self.counter]['device_id']))
-        else:
-            self.textbox_erpnext_api_secret.setPlaceholderText("c70ee57c7b3124c")
-            self.textbox_erpnext_api_key.setPlaceholderText("fb37y8fd4uh8ac")
-            self.textbox_erpnext_url.setPlaceholderText("example.erpnext.com")
-            self.textbox_pull_frequency.setPlaceholderText("60")
-
-        self.textbox_import_start_date.setPlaceholderText("DD/MM/YYYY")
-
-    @staticmethod
-    def get_shift_name_for_device(config, device_id):
-        """Return the configured shift name for a device as text for the UI."""
-        for mapping in config.shift_type_device_mapping:
-            if device_id in mapping.get('related_device_id', []):
-                shift_name = mapping.get('shift_type_name', '')
-                if isinstance(shift_name, list):
-                    return str(shift_name[0]) if shift_name else ''
-                return str(shift_name)
-        return ''
-
-    # Widgets Genrators
-    def create_label(self, label_text, label_name, x, y, height, width):
-        setattr(self,  label_name, QLabel(self))
-        label = getattr(self, label_name)
-        label.move(x, y)
-        label.setText(label_text)
-        if height and width:
-            label.resize(height, width)
-        label.show()
-
-    def create_field(self, field_name, x, y, height, width):
-        setattr(self,  field_name, QLineEdit(self))
-        field = getattr(self, field_name)
-        field.move(x, y)
-        field.resize(height, width)
-        field.show()
-
-    def create_device_fields(self, index):
-        y = 290 + (index * 35)
-        self.create_field("device_id_" + str(index), 20, y, 110, 30)
-        self.create_field("device_ip_" + str(index), 140, y, 130, 30)
-        setattr(self, "device_type_" + str(index), QComboBox(self))
-        device_type = getattr(self, "device_type_" + str(index))
-        device_type.addItems(["zkteco", "hikvision"])
-        device_type.move(280, y)
-        device_type.resize(85, 30)
-        device_type.show()
-        self.create_field("device_user_" + str(index), 375, y, 100, 30)
-        self.create_field("device_password_" + str(index), 485, y, 105, 30)
-        getattr(self, "device_password_" + str(index)).setEchoMode(QLineEdit.Password)
-        self.create_field("device_port_" + str(index), 600, y, 55, 30)
-        self.create_field("shift_" + str(index), 665, y, 200, 30)
-
-    def create_separator(self, y, width):
-        setattr(self, 'separator', QLineEdit(self))
-        field = getattr(self, 'separator')
-        field.move(0, y)
-        field.resize(width, 5)
-        field.setEnabled(False)
-        field.show()
-
-    def create_button(self, button_label, button_name, x, y, height, width, callback_function, enable=True):
-        setattr(self,  button_name, QPushButton(button_label, self))
-        button = getattr(self, button_name)
-        button.move(x, y)
-        button.resize(height, width)
-        button.clicked.connect(callback_function)
-        button.setEnabled(enable)
-
-    def center(self):
-        frame = self.frameGeometry()
-        screen = QApplication.desktop().screenNumber(QApplication.desktop().cursor().pos())
-        centerPoint = QApplication.desktop().screenGeometry(screen).center()
-        frame.moveCenter(centerPoint)
-        self.move(frame.topLeft())
-
-    def add_devices_fields(self):
-        if self.counter < 5:
-            self.counter += 1
-            self.create_device_fields(self.counter)
-
-    def validate_data(self, reg_exp, field_name):
-        field = getattr(self, field_name)
-        reg_ex = QRegExp(reg_exp)
-        input_validator = QRegExpValidator(reg_ex, field)
-        field.setValidator(input_validator)
-
-    def remove_devices_fields(self):
-        if self.counter > 0:
-            b = getattr(self, "shift_" + str(self.counter))
-            b.deleteLater()
-            b = getattr(self, "device_id_" + str(self.counter))
-            b.deleteLater()
-            b = getattr(self, "device_ip_" + str(self.counter))
-            b.deleteLater()
-            for field in ("device_type_", "device_user_", "device_password_", "device_port_"):
-                getattr(self, field + str(self.counter)).deleteLater()
-
-            self.counter -= 1
-
-    def integrate_biometric(self):
-        button = getattr(self, "start_or_stop_service")
-
-        if not hasattr(self, 'p'):
-            print("Starting Service...")
-            command = [sys.executable, '-c', 'from erpnext_sync import infinite_loop; infinite_loop()']
-            self.p = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            print("Process running at {}".format(self.p.pid))
-            button.setText("Stop Service")
-            create_message_box("Service status", "Service has been started")
-            self.create_label(str(datetime.datetime.now()), "service_start_time", 20, 60, 200, 30)
-            self.service_start_time.setHidden(True)
-            getattr(self, 'running_status').setEnabled(True)
-            QtCore.QTimer.singleShot(1000, self.check_service_startup)
-        else:
-            print("Stopping Service...")
-            self.p.kill()
-            del self.p
-            button.setText("Start Service")
-            create_message_box("Service status", "Service has been stoped")
-            getattr(self, 'running_status').setEnabled(False)
-
-    def check_service_startup(self):
-        if hasattr(self, 'p') and self.p.poll() is not None:
-            del self.p
-            getattr(self, 'start_or_stop_service').setText("Start Service")
-            getattr(self, 'running_status').setEnabled(False)
-            create_message_box(
-                "Service failed to start",
-                "The sync process exited. Install dependencies and check logs/error.log for details.",
-                "warning", width=360,
-            )
-
-    def setup_local_config(self):
-        bio_config = self.get_local_config()
-
-        print("Setting Local Configuration...")
-
-        if not bio_config:
-            print("Local Configuration not updated...")
-            return 0
-
-        if os.path.exists("local_config.py"):
-            os.remove("local_config.py")
-
-        with open("local_config.py", 'w+') as f:
-            f.write(bio_config)
-
-        print("Local Configuration Updated.")
-
-        create_message_box("Message", "Configuration Updated!\nClick on Start Service.")
-
-        getattr(self, 'start_or_stop_service').setEnabled(True)
-
-    def get_device_details(self):
-        device = {}
-        devices = []
-        shifts = []
-
-        for idx in range(0, self.counter+1):
-            shift = getattr(self, "shift_" + str(idx)).text()
-            device_id = getattr(self, "device_id_" + str(idx)).text()
-            device_type = getattr(self, "device_type_" + str(idx)).currentText()
-            port = getattr(self, "device_port_" + str(idx)).text()
-            devices.append({
-                'device_id': device_id,
-                'ip': getattr(self, "device_ip_" + str(idx)).text(),
-                'device_type': device_type,
-                'port': int(port or (80 if device_type == 'hikvision' else 4370)),
-                'username': getattr(self, "device_user_" + str(idx)).text(),
-                'password': getattr(self, "device_password_" + str(idx)).text(),
-                'major': 5,
-                'minor': 0,
-                'punch_direction': None,
-                'clear_from_device_on_fetch': False,
-                'latitude': None,
-                'longitude': None,
-            })
-            if shift in device:
-                device[shift].append(device_id)
-            else:
-                device[shift]=[device_id]
-        
-        for shift_type_name in device.keys():
-            shifts.append({
-                'shift_type_name': shift_type_name,
-                'related_device_id': device[shift_type_name]
-            })
-        return devices, shifts
-
-    def test_hikvision_connections(self):
-        found_hikvision_device = False
-        for idx in range(self.counter + 1):
-            if getattr(self, "device_type_" + str(idx)).currentText() != "hikvision":
-                continue
-            found_hikvision_device = True
-            host = getattr(self, "device_ip_" + str(idx)).text()
-            username = getattr(self, "device_user_" + str(idx)).text()
-            password = getattr(self, "device_password_" + str(idx)).text()
-            port = getattr(self, "device_port_" + str(idx)).text() or "80"
-            if not all((host, username, password)):
-                create_message_box("Hikvision configuration", "Enter the LAN IP, username, and password first.", "warning")
-                return
-            try:
-                HikvisionAttendanceClient(host, username, password, port=port).test_connection()
-            except HikvisionConnectionError as error:
-                create_message_box("Hikvision connection failed", str(error), "warning", width=400)
-                return
-        if found_hikvision_device:
-            create_message_box("Hikvision connection", "All configured Hikvision devices responded successfully.")
-        else:
-            create_message_box("Hikvision configuration", "Select Hikvision for at least one device first.", "warning")
-
-    def test_erpnext_connection(self):
-        url = self.textbox_erpnext_url.text().rstrip('/')
-        api_key = self.textbox_erpnext_api_key.text()
-        api_secret = self.textbox_erpnext_api_secret.text()
-        if not all((url, api_key, api_secret)):
-            create_message_box("ERPNext configuration", "Enter the ERPNext URL, API key, and API secret first.", "warning")
-            return
-
-        try:
-            response = requests.get(
-                url + '/api/method/frappe.auth.get_logged_user',
-                headers={'Authorization': 'token ' + api_key + ':' + api_secret},
-                timeout=15,
-            )
-            response.raise_for_status()
-            user = response.json().get('message', 'authenticated user')
-        except (requests.RequestException, ValueError) as error:
-            create_message_box("ERPNext connection failed", str(error), "warning", width=450)
-            return
-
-        create_message_box("ERPNext connection", 'Connected successfully as: ' + str(user), width=350)
-
-    def run_manual_sync(self):
-        if hasattr(self, 'p'):
-            create_message_box("Manual sync", "Stop the scheduled service before running a manual sync.", "warning", width=350)
-            return
-        if hasattr(self, 'manual_sync_process'):
-            create_message_box("Manual sync", "A manual sync is already running.", "warning")
-            return
-
-        os.makedirs(config.LOGS_DIRECTORY, exist_ok=True)
-        output_path = os.path.join(config.LOGS_DIRECTORY, 'manual_sync_console.log')
-        self.manual_sync_output = open(output_path, 'a', encoding='utf-8')
-        command = [sys.executable, '-c', 'from erpnext_sync import main; main(force=True)']
-        self.manual_sync_process = subprocess.Popen(
-            command, stdout=self.manual_sync_output, stderr=subprocess.STDOUT,
-        )
-        getattr(self, 'sync_now').setEnabled(False)
-        create_message_box("Manual sync", "Manual sync started. It may take up to the device timeout. Check Running Status and logs/manual_sync_console.log when it finishes.", width=450)
-        QtCore.QTimer.singleShot(500, self.check_manual_sync)
-
-    def check_manual_sync(self):
-        if self.manual_sync_process.poll() is None:
-            QtCore.QTimer.singleShot(500, self.check_manual_sync)
-            return
-
-        self.manual_sync_output.close()
-        exit_code = self.manual_sync_process.returncode
-        del self.manual_sync_output
-        del self.manual_sync_process
-        getattr(self, 'sync_now').setEnabled(True)
-        if exit_code:
-            create_message_box("Manual sync failed", "The manual sync process exited with an error. Check logs/manual_sync_console.log and logs/error.log.", "warning", width=450)
-        else:
-            create_message_box("Manual sync finished", "The manual sync process finished. Check Running Status for results.", width=400)
-
-    def get_local_config(self):
-        if not validate_fields(self):
-            return 0
-        string = self.textbox_import_start_date.text()
-        formated_date = "".join([ele for ele in reversed(string.split("/"))])
-
-        devices, shifts = self.get_device_details()
-        return config_template.format(
-            self.textbox_erpnext_api_key.text(), self.textbox_erpnext_api_secret.text(),
-            self.textbox_erpnext_url.text(), getattr(config, 'ERPNEXT_VERSION', 15),
-            self.textbox_pull_frequency.text(), formated_date, repr(devices), repr(shifts),
-        )
-
-    def get_running_status(self):
-        running_status = []
-        logs_path = os.path.join(config.LOGS_DIRECTORY, 'logs.log')
-        error_path = os.path.join(config.LOGS_DIRECTORY, 'error.log')
-        if not os.path.exists(logs_path) and not os.path.exists(error_path):
-            create_message_box("Running status", "No service logs exist yet. Start the service and check its configuration.", "warning", width=350)
-            return
-        if os.path.exists(logs_path):
-            with open(logs_path, 'r') as f:
-                index = 0
-                for idx, line in enumerate(f, 1):
-                    logdate = convert_into_date(line.split(',')[0], '%Y-%m-%d %H:%M:%S')
-                    if logdate and logdate >= convert_into_date(self.service_start_time.text().split('.')[0], '%Y-%m-%d %H:%M:%S'):
-                        index = idx
-                        break
-                if index:
-                    running_status.extend(read_file_contents('logs', index))
-
-        if os.path.exists(error_path):
-            with open(error_path, 'r') as fread:
-                error_index = 0
-                for error_idx, error_line in enumerate(fread, 1):
-                    start_date = convert_into_date(self.service_start_time.text().split('.')[0], '%Y-%m-%d %H:%M:%S')
-                    if start_date and start_date.strftime('%Y-%m-%d') in error_line:
-                        error_logdate = convert_into_date(error_line.split(',')[0], '%Y-%m-%d %H:%M:%S')
-                        if error_logdate and error_logdate >= start_date:
-                            error_index = error_idx
-                            break
-                if error_index:
-                    running_status.extend(read_file_contents('error', error_index))
-
-        if running_status:
-            create_message_box("Running status", ''.join(running_status))
-        else:
-            create_message_box("Running status", 'Process not yet started')
-
-def read_file_contents(file_name, index):
-    running_status = []
-    with open('/'.join([config.LOGS_DIRECTORY])+f'/{file_name}.log', 'r') as file_handler:
-        for idx, line in enumerate(file_handler,1):
-            if idx>=index:
-                running_status.append(line)
-    return running_status
-
-
-def validate_fields(self):
-    def message(text):
-        create_message_box("Missing Value", "Please Set {}".format(text), "warning")
-
-    if not self.textbox_erpnext_api_key.text():
-        return message("API Key")
-
-    if not self.textbox_erpnext_api_secret.text():
-        return message("API Secret")
-
-    if not self.textbox_erpnext_url.text():
-        return message("ERPNext URL")
-
-    if not self.textbox_import_start_date.text():
-        return message("Import Start Date")
-
-    return validate_date(self.textbox_import_start_date.text())
-
-
-def validate_date(date):
-    try:
-        datetime.datetime.strptime(date, '%d/%m/%Y')
-        return True
-    except ValueError:
-        create_message_box("", "Please Enter Date in correct format", "warning", width=200)
-        return False
-
-
-def convert_into_date(datestring, pattern):
-    try:
-        return datetime.datetime.strptime(datestring, pattern)
-    except:
-        return None
-
-
-def create_message_box(title, text, icon="information", width=150):
-    msg = QMessageBox()
-    msg.setWindowTitle(title)
-    lineCnt = len(text.split('\n'))
-    if lineCnt > 15:
-        scroll = QtWidgets.QScrollArea()
-        scroll.setWidgetResizable(1)
-        content = QtWidgets.QWidget()
-        scroll.setWidget(content)
-        layout = QtWidgets.QVBoxLayout(content)
-        tmpLabel = QtWidgets.QLabel(text)
-        tmpLabel.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-        layout.addWidget(tmpLabel)
-        msg.layout().addWidget(scroll, 12, 10, 1, msg.layout().columnCount())
-        msg.setStyleSheet("QScrollArea{min-width:550 px; min-height: 400px}")
-    else:
-        msg.setText(text)
-        if icon == "warning":
-            msg.setIcon(QtWidgets.QMessageBox.Warning)
-            msg.setStyleSheet("QMessageBox Warning{min-width: 50 px;}")
-        else:
-            msg.setIcon(QtWidgets.QMessageBox.Information)
-            msg.setStyleSheet("QMessageBox Information{min-width: 50 px;}")
-        msg.setStyleSheet("QmessageBox QLabel{min-width: "+str(width)+"px;}")
-    msg.exec_()
+        if not self.allow_exit and self.tray:
+            self.hide(); self.tray.showMessage("Attendance Sync", "The application is running in the system tray.", QSystemTrayIcon.Information, 2000); event.ignore()
+        elif self.service or self.manual: message(self, "Sync active", "Stop the service and wait for manual sync to finish before closing.", True); event.ignore()
+        else: event.accept()
+
+    def changeEvent(self, event):
+        if event.type() == QtCore.QEvent.WindowStateChange and self.isMinimized() and self.tray:
+            QtCore.QTimer.singleShot(0, self.hide)
+        super().changeEvent(event)
 
 
 def setup_window():
-    biometric_app = QApplication(sys.argv)
-    biometric_window = BiometricWindow()
-    biometric_app.exec_()
+    set_windows_application_id()
+    app = QApplication(sys.argv); app.setStyleSheet(STYLE); app.setWindowIcon(QIcon(resource_path("assets", "attendance_sync.ico")))
+    splash_image = QPixmap(resource_path("assets", "attendance_sync.png")).scaled(360, 360, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+    splash = QSplashScreen(splash_image); splash.showMessage("Starting Attendance Sync…", QtCore.Qt.AlignBottom | QtCore.Qt.AlignHCenter, QtCore.Qt.white); splash.show(); app.processEvents()
+
+    def open_main_window():
+        app.main_window = AttendanceWindow()
+        app.main_window.show()
+        splash.finish(app.main_window)
+
+    QtCore.QTimer.singleShot(1400, open_main_window)
+    sys.exit(app.exec_())
 
 
-if __name__ == "__main__":
-    setup_window()
+if __name__ == "__main__": setup_window()
