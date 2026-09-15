@@ -10,6 +10,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 from pickledb import PickleDB
 from zk import ZK, const
+from hikvision import HikvisionAttendanceClient
 
 EMPLOYEE_NOT_FOUND_ERROR_MESSAGE = "No Employee found for the given employee field value"
 EMPLOYEE_INACTIVE_ERROR_MESSAGE = "Transactions cannot be created for an Inactive Employee"
@@ -38,16 +39,16 @@ ERPNEXT_VERSION = getattr(config, 'ERPNEXT_VERSION', 14)
 #  - <device_id>_push_timestamp
 #  - <shift_type>_sync_timestamp
 
-def main():
+def main(force=False):
     """Takes care of checking if it is time to pull data based on config,
     then calling the relevent functions to pull data and push to EPRNext.
 
     """
     try:
         last_lift_off_timestamp = _safe_convert_date(status.get('lift_off_timestamp'), "%Y-%m-%d %H:%M:%S.%f")
-        if (last_lift_off_timestamp and last_lift_off_timestamp < datetime.datetime.now() - datetime.timedelta(minutes=config.PULL_FREQUENCY)) or not last_lift_off_timestamp:
+        if force or (last_lift_off_timestamp and last_lift_off_timestamp < datetime.datetime.now() - datetime.timedelta(minutes=config.PULL_FREQUENCY)) or not last_lift_off_timestamp:
             status.set('lift_off_timestamp', str(datetime.datetime.now()))
-            status.save()
+            save_status()
             info_logger.info("Cleared for lift off!")
             for device in config.devices:
                 device_attendance_logs = None
@@ -62,16 +63,18 @@ def main():
                 try:
                     pull_process_and_push_data(device, device_attendance_logs)
                     status.set(f'{device["device_id"]}_push_timestamp', str(datetime.datetime.now()))
-                    status.save()
+                    if device.get('device_type', 'zkteco').lower() == 'hikvision':
+                        status.set(f'{device["device_id"]}_hikvision_sync', str(datetime.datetime.now()))
+                    save_status()
                     if os.path.exists(dump_file):
                         os.remove(dump_file)
                     info_logger.info("Successfully processed Device: "+ device['device_id'])
                 except:
-                    error_logger.exception('exception when calling pull_process_and_push_data function for device'+json.dumps(device, default=str))
+                    error_logger.exception('exception when calling pull_process_and_push_data function for device'+json.dumps(_loggable_device(device), default=str))
             if hasattr(config,'shift_type_device_mapping'):
                 update_shift_last_sync_timestamp(config.shift_type_device_mapping)
             status.set('mission_accomplished_timestamp', str(datetime.datetime.now()))
-            status.save()
+            save_status()
             info_logger.info("Mission Accomplished!")
     except:
         error_logger.exception('exception has occurred in the main function...')
@@ -89,7 +92,7 @@ def pull_process_and_push_data(device, device_attendance_logs=None):
     attendance_success_logger = setup_logger(attendance_success_log_file, '/'.join([config.LOGS_DIRECTORY, attendance_success_log_file])+'.log')
     attendance_failed_logger = setup_logger(attendance_failed_log_file, '/'.join([config.LOGS_DIRECTORY, attendance_failed_log_file])+'.log')
     if not device_attendance_logs:
-        device_attendance_logs = get_all_attendance_from_device(device['ip'], device_id=device['device_id'], clear_from_device_on_fetch=device['clear_from_device_on_fetch'])
+        device_attendance_logs = get_attendance_from_device(device)
         if not device_attendance_logs:
             return
     # for finding the last successfull push and restart from that point (or) from a set 'config.IMPORT_START_DATE' (whichever is later)
@@ -120,7 +123,7 @@ def pull_process_and_push_data(device, device_attendance_logs=None):
                     break
 
     for device_attendance_log in device_attendance_logs[index_of_last+1:]:
-        punch_direction = device['punch_direction']
+        punch_direction = device.get('punch_direction')
         if punch_direction == 'AUTO':
             if device_attendance_log['punch'] in device_punch_values_OUT:
                 punch_direction = 'OUT'
@@ -128,7 +131,11 @@ def pull_process_and_push_data(device, device_attendance_logs=None):
                 punch_direction = 'IN'
             else:
                 punch_direction = None
-        erpnext_status_code, erpnext_message = send_to_erpnext(device_attendance_log['user_id'], device_attendance_log['timestamp'], device['device_id'], punch_direction, latitude=device['latitude'], longitude=device['longitude'])
+        erpnext_status_code, erpnext_message = send_to_erpnext(
+            device_attendance_log['user_id'], device_attendance_log['timestamp'],
+            device['device_id'], punch_direction,
+            latitude=device.get('latitude'), longitude=device.get('longitude'),
+        )
         if erpnext_status_code == 200:
             attendance_success_logger.info("\t".join([erpnext_message, str(device_attendance_log['uid']),
                 str(device_attendance_log['user_id']), str(device_attendance_log['timestamp'].timestamp()),
@@ -141,6 +148,44 @@ def pull_process_and_push_data(device, device_attendance_logs=None):
                 json.dumps(device_attendance_log, default=str)]))
             if not(any(error in erpnext_message for error in allowlisted_errors)):
                 raise Exception('API Call to ERPNext Failed.')
+
+
+def get_attendance_from_device(device):
+    if device.get('device_type', 'zkteco').lower() == 'hikvision':
+        return get_hikvision_attendance_from_device(device)
+    return get_all_attendance_from_device(
+        device['ip'],
+        port=device.get('port', 4370),
+        device_id=device['device_id'],
+        clear_from_device_on_fetch=device.get('clear_from_device_on_fetch', False),
+    )
+
+
+def get_hikvision_attendance_from_device(device):
+    """Fetch Hikvision ISAPI access events from a private-LAN device."""
+    last_sync = _safe_convert_date(status.get(f'{device["device_id"]}_hikvision_sync'), "%Y-%m-%d %H:%M:%S.%f")
+    import_start = _safe_convert_date(config.IMPORT_START_DATE, "%Y%m%d")
+    start_time = last_sync or import_start or (datetime.datetime.now() - datetime.timedelta(days=1))
+    end_time = datetime.datetime.now()
+    client = HikvisionAttendanceClient(
+        host=device['ip'],
+        username=device['username'],
+        password=device['password'],
+        port=device.get('port', 80),
+        use_https=device.get('use_https', False),
+        timeout=device.get('timeout', 15),
+        major=device.get('major', 5),
+        minor=device.get('minor', 0),
+    )
+    events = client.fetch_events(start_time, end_time)
+    if client.skipped_event_count:
+        info_logger.warning(
+            'Skipped %s Hikvision events without valid employee attendance data for device %s.',
+            client.skipped_event_count, device['device_id'],
+        )
+    status.set(f'{device["device_id"]}_pull_timestamp', str(end_time))
+    save_status()
+    return events
 
 
 def get_all_attendance_from_device(ip, port=4370, timeout=30, device_id=None, clear_from_device_on_fetch=False):
@@ -157,7 +202,7 @@ def get_all_attendance_from_device(ip, port=4370, timeout=30, device_id=None, cl
         info_logger.info("\t".join((ip, "Attendances Fetched:", str(len(attendances)))))
         status.set(f'{device_id}_push_timestamp', None)
         status.set(f'{device_id}_pull_timestamp', str(datetime.datetime.now()))
-        status.save()
+        save_status()
         if len(attendances):
             # keeping a backup before clearing data incase the programs fails.
             # if everything goes well then this file is removed automatically at the end.
@@ -243,7 +288,7 @@ def update_shift_last_sync_timestamp(shift_type_device_mapping):
                         response_code = send_shift_sync_to_erpnext(shift, min_pull_timestamp)
                         if response_code == 200:
                             status.set(f'{shift}_sync_timestamp', str(min_pull_timestamp))
-                            status.save()
+                            save_status()
                 except:
                     error_logger.exception('Exception in update_shift_last_sync_timestamp, for shift:'+shift)
 
@@ -326,12 +371,24 @@ def _safe_get_error_str(res):
         error_str = str(res.__dict__)
     return error_str
 
+
+def _loggable_device(device):
+    safe_device = dict(device)
+    if 'password' in safe_device:
+        safe_device['password'] = '[redacted]'
+    return safe_device
+
 # setup logger and status
 if not os.path.exists(config.LOGS_DIRECTORY):
     os.makedirs(config.LOGS_DIRECTORY)
 error_logger = setup_logger('error_logger', '/'.join([config.LOGS_DIRECTORY, 'error.log']), logging.ERROR)
 info_logger = setup_logger('info_logger', '/'.join([config.LOGS_DIRECTORY, 'logs.log']))
-status = PickleDB('/'.join([config.LOGS_DIRECTORY, 'status.json']))
+status = PickleDB('/'.join([config.LOGS_DIRECTORY, 'status.json']), auto_dump=True, sig=False)
+
+
+def save_status():
+    """Persist status for PickleDB releases that use dump instead of save."""
+    status.dump()
 
 def infinite_loop(sleep_time=15):
     print("Service Running...")

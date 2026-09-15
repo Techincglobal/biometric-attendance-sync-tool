@@ -3,7 +3,7 @@
 ERPNEXT_API_KEY = ''
 ERPNEXT_API_SECRET = ''
 ERPNEXT_URL = 'http://dev.local:8000'
-ERPNEXT_VERSION = 13
+ERPNEXT_VERSION = 15
 
 
 # operational configs
@@ -23,6 +23,14 @@ devices = [
     {'device_id':'test_1','ip':'192.168.0.209', 'punch_direction': None, 'clear_from_device_on_fetch': False, 'latitude':0.0000,'longitude':0.0000},
     {'device_id':'test_2','ip':'192.168.2.209', 'punch_direction': None, 'clear_from_device_on_fetch': False, 'latitude':0.0000,'longitude':0.0000}
 ]
+
+# Hikvision ISAPI device example. The computer running this app must be on the
+# same LAN/Wi-Fi as the device; do not expose the device to the public internet.
+# Replace the values and add this dictionary to `devices` when using Hikvision.
+# {'device_id': 'hik_lobby', 'device_type': 'hikvision', 'ip': '192.168.1.50',
+#  'port': 80, 'use_https': False, 'username': 'admin', 'password': 'CHANGE_ME',
+#  'major': 5, 'minor': 0, 'timeout': 15, 'punch_direction': None,
+#  'clear_from_device_on_fetch': False, 'latitude': 0.0, 'longitude': 0.0}
 
 # Configs updating sync timestamp in the Shift Type DocType 
 # please, read this thread to know why this is necessary https://discuss.erpnext.com/t/v-12-hr-auto-attendance-purpose-of-last-sync-of-checkin-in-shift-type/52997
