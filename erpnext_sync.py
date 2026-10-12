@@ -42,7 +42,7 @@ ERPNEXT_VERSION = getattr(config, 'ERPNEXT_VERSION', 14)
 #  - <device_id>_push_timestamp
 #  - <shift_type>_sync_timestamp
 
-def main(force=False):
+def main(force=False, reset_hikvision_cursor=False):
     """Takes care of checking if it is time to pull data based on config,
     then calling the relevent functions to pull data and push to EPRNext.
 
@@ -54,6 +54,10 @@ def main(force=False):
             save_status()
             info_logger.info("Cleared for lift off!")
             for device in config.devices:
+                if reset_hikvision_cursor and device.get('device_type', '').lower() == 'hikvision':
+                    status.rem(f'{device["device_id"]}_hikvision_sync')
+                    save_status()
+                    info_logger.info('Reset Hikvision sync cursor for device: ' + device['device_id'])
                 device_attendance_logs = None
                 info_logger.info("Processing Device: "+ device['device_id'])
                 dump_file = get_dump_file_name_and_directory(device['device_id'], device['ip'])
@@ -64,7 +68,11 @@ def main(force=False):
                         if file_contents:
                             device_attendance_logs = list(map(lambda x: _apply_function_to_key(x, 'timestamp', datetime.datetime.fromtimestamp), json.loads(file_contents)))
                 try:
-                    pull_process_and_push_data(device, device_attendance_logs)
+                    pull_process_and_push_data(
+                        device,
+                        device_attendance_logs,
+                        replay_history=reset_hikvision_cursor and device.get('device_type', '').lower() == 'hikvision',
+                    )
                     status.set(f'{device["device_id"]}_push_timestamp', str(datetime.datetime.now()))
                     if device.get('device_type', 'zkteco').lower() == 'hikvision':
                         status.set(f'{device["device_id"]}_hikvision_sync', str(datetime.datetime.now()))
@@ -83,7 +91,7 @@ def main(force=False):
         error_logger.exception('exception has occurred in the main function...')
 
 
-def pull_process_and_push_data(device, device_attendance_logs=None):
+def pull_process_and_push_data(device, device_attendance_logs=None, replay_history=False):
     """ Takes a single device config as param and pulls data from that device.
 
     params:
@@ -92,15 +100,20 @@ def pull_process_and_push_data(device, device_attendance_logs=None):
     """
     attendance_success_log_file = '_'.join(["attendance_success_log", device['device_id']])
     attendance_failed_log_file = '_'.join(["attendance_failed_log", device['device_id']])
+    attendance_audit_log_file = '_'.join(["erpnext_audit_log", device['device_id']])
     attendance_success_logger = setup_logger(attendance_success_log_file, '/'.join([config.LOGS_DIRECTORY, attendance_success_log_file])+'.log')
     attendance_failed_logger = setup_logger(attendance_failed_log_file, '/'.join([config.LOGS_DIRECTORY, attendance_failed_log_file])+'.log')
+    attendance_audit_logger = setup_logger(attendance_audit_log_file, '/'.join([config.LOGS_DIRECTORY, attendance_audit_log_file])+'.log')
     if not device_attendance_logs:
         device_attendance_logs = get_attendance_from_device(device)
         if not device_attendance_logs:
+            info_logger.info('No new attendance records found for device: ' + device['device_id'])
+            attendance_audit_logger.info(json.dumps({'event': 'no_attendance_data', 'device_id': device['device_id']}))
             return
-    # for finding the last successfull push and restart from that point (or) from a set 'config.IMPORT_START_DATE' (whichever is later)
+    # Normal polls resume from the last success. A deliberate Hikvision backfill
+    # retries the whole selected range; ERPNext identifies duplicate check-ins.
     index_of_last = -1
-    last_line = get_last_line_from_file('/'.join([config.LOGS_DIRECTORY, attendance_success_log_file])+'.log')
+    last_line = None if replay_history else get_last_line_from_file('/'.join([config.LOGS_DIRECTORY, attendance_success_log_file])+'.log')
     import_start_date = _safe_convert_date(config.IMPORT_START_DATE, "%Y%m%d")
     if last_line or import_start_date:
         last_user_id = None
@@ -134,11 +147,24 @@ def pull_process_and_push_data(device, device_attendance_logs=None):
                 punch_direction = 'IN'
             else:
                 punch_direction = None
-        erpnext_status_code, erpnext_message = send_to_erpnext(
-            device_attendance_log['user_id'], device_attendance_log['timestamp'],
-            device['device_id'], punch_direction,
-            latitude=device.get('latitude'), longitude=device.get('longitude'),
-        )
+        audit_entry = build_audit_entry(device, device_attendance_log, punch_direction)
+        attendance_audit_logger.info('REQUEST\t' + json.dumps(audit_entry, default=str))
+        try:
+            erpnext_status_code, erpnext_message = send_to_erpnext(
+                device_attendance_log['user_id'], device_attendance_log['timestamp'],
+                device['device_id'], punch_direction,
+                latitude=device.get('latitude'), longitude=device.get('longitude'),
+            )
+        except Exception as error:
+            audit_entry.update({'result': 'request_exception', 'message': str(error)})
+            attendance_audit_logger.error('RESULT\t' + json.dumps(audit_entry, default=str))
+            raise
+        audit_entry.update({
+            'result': 'posted' if erpnext_status_code == 200 else 'rejected',
+            'status_code': erpnext_status_code,
+            'response': erpnext_message,
+        })
+        attendance_audit_logger.info('RESULT\t' + json.dumps(audit_entry, default=str))
         if erpnext_status_code == 200:
             attendance_success_logger.info("\t".join([erpnext_message, str(device_attendance_log['uid']),
                 str(device_attendance_log['user_id']), str(device_attendance_log['timestamp'].timestamp()),
@@ -164,11 +190,30 @@ def get_attendance_from_device(device):
     )
 
 
+def build_audit_entry(device, attendance_log, punch_direction):
+    raw_event = attendance_log.get('raw', {})
+    return {
+        'event': 'erpnext_employee_checkin',
+        'device_id': device['device_id'],
+        'employee_field_value': str(attendance_log.get('user_id')),
+        'timestamp': str(attendance_log.get('timestamp')),
+        'log_type': punch_direction,
+        'verification_mode': raw_event.get('currentVerifyMode'),
+        'event_serial_number': attendance_log.get('uid'),
+        'event_major': attendance_log.get('status'),
+        'event_minor': attendance_log.get('punch'),
+    }
+
+
 def get_hikvision_attendance_from_device(device):
     """Fetch Hikvision ISAPI access events from a private-LAN device."""
     last_sync = _safe_convert_date(status.get(f'{device["device_id"]}_hikvision_sync'), "%Y-%m-%d %H:%M:%S.%f")
     import_start = _safe_convert_date(config.IMPORT_START_DATE, "%Y%m%d")
-    start_time = last_sync or import_start or (datetime.datetime.now() - datetime.timedelta(days=1))
+    if last_sync:
+        overlap = datetime.timedelta(minutes=getattr(config, 'HIKVISION_LOOKBACK_MINUTES', 240))
+        start_time = last_sync - overlap
+    else:
+        start_time = import_start or (datetime.datetime.now() - datetime.timedelta(days=1))
     end_time = datetime.datetime.now()
     client = HikvisionAttendanceClient(
         host=device['ip'],
@@ -181,6 +226,14 @@ def get_hikvision_attendance_from_device(device):
         minor=device.get('minor', 0),
     )
     events = client.fetch_events(start_time, end_time)
+    info_logger.info(
+        'Hikvision returned %s attendance event(s) for device %s between %s and %s: %s',
+        len(events),
+        device['device_id'],
+        start_time.strftime('%Y-%m-%d %H:%M:%S'),
+        end_time.strftime('%Y-%m-%d %H:%M:%S'),
+        _describe_hikvision_events(events),
+    )
     if client.skipped_event_count:
         info_logger.warning(
             'Skipped %s Hikvision events without valid employee attendance data for device %s.',
@@ -189,6 +242,17 @@ def get_hikvision_attendance_from_device(device):
     status.set(f'{device["device_id"]}_pull_timestamp', str(end_time))
     save_status()
     return events
+
+
+def _describe_hikvision_events(events):
+    """Keep normal diagnostics readable when a terminal has a long history."""
+    summary = ', '.join(
+        '%s at %s (serial %s)' % (event['user_id'], event['timestamp'], event['uid'])
+        for event in events[:20]
+    )
+    if len(events) > 20:
+        summary += ' ... and %s more' % (len(events) - 20)
+    return summary or 'none'
 
 
 def get_all_attendance_from_device(ip, port=4370, timeout=30, device_id=None, clear_from_device_on_fetch=False):

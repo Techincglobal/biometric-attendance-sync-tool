@@ -131,7 +131,7 @@ class AttendanceWindow(QMainWindow):
         grid = QGridLayout(); self.stats = []
         for index, (label, value, note) in enumerate((("Devices", "0", "configured"), ("Last successful sync", "—", "not recorded"), ("Errors", "0", "in error log"), ("Service", "Stopped", "manual available"))):
             card = QFrame(); card.setObjectName("card"); box = QVBoxLayout(card); small = QLabel(label.upper()); small.setObjectName("eyebrow"); number = QLabel(value); number.setStyleSheet("font-size:23px;font-weight:600;"); muted = QLabel(note); muted.setObjectName("muted"); box.addWidget(small); box.addWidget(number); box.addWidget(muted); grid.addWidget(card, 0, index); self.stats.append(number)
-        layout.addLayout(grid); actions = QHBoxLayout(); self.sync_button = QPushButton("Sync now"); self.sync_button.clicked.connect(self.manual_sync); self.service_button = QPushButton("Start service"); self.service_button.clicked.connect(self.toggle_service); open_logs = QPushButton("Open live logs"); open_logs.clicked.connect(lambda: self.show_page(3)); actions.addWidget(self.sync_button); actions.addWidget(self.service_button); actions.addWidget(open_logs); actions.addStretch(); layout.addLayout(actions)
+        layout.addLayout(grid); actions = QHBoxLayout(); self.sync_button = QPushButton("Sync now"); self.sync_button.clicked.connect(self.manual_sync); backfill = QPushButton("Backfill device data"); backfill.clicked.connect(lambda: self.manual_sync(backfill=True)); self.service_button = QPushButton("Start service"); self.service_button.clicked.connect(self.toggle_service); open_logs = QPushButton("Open live logs"); open_logs.clicked.connect(lambda: self.show_page(3)); actions.addWidget(self.sync_button); actions.addWidget(backfill); actions.addWidget(self.service_button); actions.addWidget(open_logs); actions.addStretch(); layout.addLayout(actions)
         self.dashboard_table = self.table(["Device", "Type", "LAN address", "Last sync", "Status"]); layout.addWidget(self.dashboard_table, 1); return page
 
     def devices_page(self):
@@ -148,11 +148,11 @@ class AttendanceWindow(QMainWindow):
         actions = QHBoxLayout(); test, save = QPushButton("Test ERPNext"), QPushButton("Save connection"); test.clicked.connect(self.test_erp); save.clicked.connect(self.save); actions.addWidget(test); actions.addWidget(save); actions.addStretch(); layout.addLayout(actions); layout.addStretch(); return page
 
     def logs_page(self):
-        page, layout = self.shell("Diagnostics", "Live logs.", "Read service output locally for device, ERPNext, and manual-sync debugging."); actions = QHBoxLayout(); self.log_choice = QComboBox(); self.log_choice.addItems(["Service log", "Error log", "Manual sync console"]); self.log_choice.currentIndexChanged.connect(self.refresh_logs); refresh = QPushButton("Refresh"); refresh.clicked.connect(self.refresh_logs); actions.addWidget(self.log_choice); actions.addWidget(refresh); actions.addStretch(); layout.addLayout(actions); self.log_view = QPlainTextEdit(); self.log_view.setReadOnly(True); self.log_view.setLineWrapMode(QPlainTextEdit.NoWrap); layout.addWidget(self.log_view, 1); return page
+        page, layout = self.shell("Diagnostics", "Live logs.", "Read service output locally for device, ERPNext, and manual-sync debugging."); actions = QHBoxLayout(); self.log_choice = QComboBox(); self.log_choice.currentIndexChanged.connect(self.refresh_logs); refresh = QPushButton("Refresh"); refresh.clicked.connect(self.refresh_logs); actions.addWidget(self.log_choice); actions.addWidget(refresh); actions.addStretch(); layout.addLayout(actions); self.log_view = QPlainTextEdit(); self.log_view.setReadOnly(True); self.log_view.setLineWrapMode(QPlainTextEdit.NoWrap); layout.addWidget(self.log_view, 1); return page
 
     def settings_page(self):
         page, layout = self.shell("Preferences", "Control the local service.", "Manual sync is always available. Start the service only when timed polling is required.")
-        card = QFrame(); card.setObjectName("card"); form = QFormLayout(card); form.setContentsMargins(24, 24, 24, 24); self.frequency = QSpinBox(); self.frequency.setRange(1, 1440); self.frequency.setValue(int(config.PULL_FREQUENCY)); self.start_date = line(config.IMPORT_START_DATE or ""); self.log_size = QSpinBox(); self.log_size.setRange(1, 100); self.log_size.setValue(int(getattr(config, "LOG_MAX_MB", 2))); self.log_days = QSpinBox(); self.log_days.setRange(1, 365); self.log_days.setValue(int(getattr(config, "LOG_RETENTION_DAYS", 30))); form.addRow("Pull frequency (minutes)", self.frequency); form.addRow("Import start date (YYYYMMDD)", self.start_date); form.addRow("Archive logs after (MB)", self.log_size); form.addRow("Delete archived logs after (days)", self.log_days); layout.addWidget(card); save = QPushButton("Save settings"); save.clicked.connect(self.save); layout.addWidget(save); layout.addStretch(); return page
+        card = QFrame(); card.setObjectName("card"); form = QFormLayout(card); form.setContentsMargins(24, 24, 24, 24); self.frequency = QSpinBox(); self.frequency.setRange(1, 1440); self.frequency.setValue(int(config.PULL_FREQUENCY)); self.start_date = line(config.IMPORT_START_DATE or ""); self.hikvision_lookback = QSpinBox(); self.hikvision_lookback.setRange(5, 1440); self.hikvision_lookback.setValue(int(getattr(config, "HIKVISION_LOOKBACK_MINUTES", 240))); self.log_size = QSpinBox(); self.log_size.setRange(1, 100); self.log_size.setValue(int(getattr(config, "LOG_MAX_MB", 2))); self.log_days = QSpinBox(); self.log_days.setRange(1, 365); self.log_days.setValue(int(getattr(config, "LOG_RETENTION_DAYS", 30))); form.addRow("Pull frequency (minutes)", self.frequency); form.addRow("Import start date (YYYYMMDD)", self.start_date); form.addRow("Hikvision late-event overlap (minutes)", self.hikvision_lookback); form.addRow("Archive logs after (MB)", self.log_size); form.addRow("Delete archived logs after (days)", self.log_days); layout.addWidget(card); save = QPushButton("Save settings"); save.clicked.connect(self.save); layout.addWidget(save); layout.addStretch(); return page
 
     def table(self, headers):
         table = QTableWidget(0, len(headers)); table.setHorizontalHeaderLabels(headers); table.setEditTriggers(QTableWidget.NoEditTriggers); table.horizontalHeader().setStretchLastSection(True); return table
@@ -163,7 +163,7 @@ class AttendanceWindow(QMainWindow):
         if index == 3: self.refresh_logs()
         if index in (0, 1): self.refresh_all()
 
-    def refresh_all(self): self.refresh_devices(); self.refresh_dashboard(); self.refresh_logs()
+    def refresh_all(self): self.refresh_devices(); self.refresh_dashboard(); self.refresh_log_sources(); self.refresh_logs()
 
     def refresh_devices(self):
         self.devices_table.setRowCount(len(self.devices))
@@ -247,11 +247,13 @@ class AttendanceWindow(QMainWindow):
         except (requests.RequestException, ValueError) as error: return message(self, "ERPNext connection failed", str(error), True)
         message(self, "ERPNext connection", "Connected successfully as: " + str(user))
 
-    def manual_sync(self):
+    def manual_sync(self, backfill=False):
         if self.service: return message(self, "Manual sync", "Stop the timed service before starting a manual sync.", True)
         if self.manual: return
+        if backfill and QMessageBox.question(self, "Backfill device data", "Resend all device records from the configured Import Start Date? ERPNext may reject duplicates safely.") != QMessageBox.Yes: return
         os.makedirs(config.LOGS_DIRECTORY, exist_ok=True); self.output = open(os.path.join(config.LOGS_DIRECTORY, "manual_sync_console.log"), "a", encoding="utf-8")
-        self.manual = subprocess.Popen([sys.executable, "-c", "from erpnext_sync import main; main(force=True)"], stdout=self.output, stderr=subprocess.STDOUT); self.sync_button.setEnabled(False); QtCore.QTimer.singleShot(500, self.check_manual)
+        command = "from erpnext_sync import main; main(force=True, reset_hikvision_cursor=True)" if backfill else "from erpnext_sync import main; main(force=True)"
+        self.manual = subprocess.Popen([sys.executable, "-c", command], stdout=self.output, stderr=subprocess.STDOUT); self.sync_button.setEnabled(False); QtCore.QTimer.singleShot(500, self.check_manual)
 
     def check_manual(self):
         if self.manual.poll() is None: return QtCore.QTimer.singleShot(500, self.check_manual)
@@ -283,11 +285,24 @@ class AttendanceWindow(QMainWindow):
         QApplication.quit()
 
     def refresh_logs(self):
-        files = ["logs.log", "error.log", "manual_sync_console.log"]; index = self.log_choice.currentIndex() if hasattr(self, "log_choice") else 0
+        if not hasattr(self, "log_choice"): return
+        index = self.log_choice.currentIndex(); files = ["logs.log", "error.log", "manual_sync_console.log"]
+        filename = self.log_choice.itemData(index) or files[index]
         try:
-            with open(os.path.join(config.LOGS_DIRECTORY, files[index]), encoding="utf-8") as handle: text = handle.read()[-30000:]
+            with open(os.path.join(config.LOGS_DIRECTORY, filename), encoding="utf-8") as handle: text = handle.read()[-30000:]
         except OSError: text = "No log file exists yet."
         if hasattr(self, "log_view"): self.log_view.setPlainText(text)
+
+    def refresh_log_sources(self):
+        current = self.log_choice.currentData()
+        self.log_choice.blockSignals(True); self.log_choice.clear()
+        for label, filename in (("Service log", "logs.log"), ("Error log", "error.log"), ("Manual sync console", "manual_sync_console.log")):
+            self.log_choice.addItem(label, filename)
+        for device in self.devices:
+            device_id = device.get("device_id")
+            if device_id: self.log_choice.addItem("ERPNext audit · " + device_id, "erpnext_audit_log_" + device_id + ".log")
+        position = self.log_choice.findData(current)
+        self.log_choice.setCurrentIndex(position if position >= 0 else 0); self.log_choice.blockSignals(False)
 
     def shift(self, device_id):
         for mapping in getattr(config, "shift_type_device_mapping", []):
@@ -305,7 +320,7 @@ class AttendanceWindow(QMainWindow):
             if device.get("shift"): groups.setdefault(device["shift"], []).append(device["device_id"])
         mappings = [{"shift_type_name": name, "related_device_id": ids} for name, ids in groups.items()]
         saved_devices = [{key: value for key, value in device.items() if key != "shift"} for device in self.devices]
-        content = "\n".join(["ERPNEXT_API_KEY = " + repr(self.erp_key.text().strip()), "ERPNEXT_API_SECRET = " + repr(self.erp_secret.text().strip()), "ERPNEXT_URL = " + repr(self.erp_url.text().strip().rstrip("/")), "ERPNEXT_VERSION = " + repr(getattr(config, "ERPNEXT_VERSION", 15)), "PULL_FREQUENCY = " + repr(self.frequency.value()), "LOGS_DIRECTORY = " + repr(getattr(config, "LOGS_DIRECTORY", "logs")), "LOG_MAX_MB = " + repr(self.log_size.value()), "LOG_RETENTION_DAYS = " + repr(self.log_days.value()), "IMPORT_START_DATE = " + repr(self.start_date.text().strip() or None), "devices = " + repr(saved_devices), "shift_type_device_mapping = " + repr(mappings), "allowed_exceptions = [1, 2, 3]", ""])
+        content = "\n".join(["ERPNEXT_API_KEY = " + repr(self.erp_key.text().strip()), "ERPNEXT_API_SECRET = " + repr(self.erp_secret.text().strip()), "ERPNEXT_URL = " + repr(self.erp_url.text().strip().rstrip("/")), "ERPNEXT_VERSION = " + repr(getattr(config, "ERPNEXT_VERSION", 15)), "PULL_FREQUENCY = " + repr(self.frequency.value()), "HIKVISION_LOOKBACK_MINUTES = " + repr(self.hikvision_lookback.value()), "LOGS_DIRECTORY = " + repr(getattr(config, "LOGS_DIRECTORY", "logs")), "LOG_MAX_MB = " + repr(self.log_size.value()), "LOG_RETENTION_DAYS = " + repr(self.log_days.value()), "IMPORT_START_DATE = " + repr(self.start_date.text().strip() or None), "devices = " + repr(saved_devices), "shift_type_device_mapping = " + repr(mappings), "allowed_exceptions = [1, 2, 3]", ""])
         with open(config_path(), "w", encoding="utf-8") as handle: handle.write(content)
         config = load_config()
         message(self, "Configuration saved", "Saved locally. Test ERPNext or use Sync now to verify it.")

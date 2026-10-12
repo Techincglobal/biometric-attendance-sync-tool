@@ -8,6 +8,7 @@ ERPNEXT_VERSION = 15
 
 # operational configs
 PULL_FREQUENCY = 60 # in minutes
+HIKVISION_LOOKBACK_MINUTES = 240 # re-read this window to capture delayed terminal events
 LOGS_DIRECTORY = 'logs' # logs of this script is stored in this directory
 LOG_MAX_MB = 2 # archive a log when it reaches this size
 LOG_RETENTION_DAYS = 30 # delete archived logs older than this
